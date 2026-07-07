@@ -2,7 +2,7 @@
 janus_core.py
 =============
 Project : Janus — Custom Layer 7 Load Balancer
-Phase   : 2 — Byte-Stream Accumulation & HTTP Request Parsing
+Phase   : 3 — Downstream Proxy Routing & Round-Robin Balance
 
 Constraints (strictly honoured):
   • No FastAPI / asyncio / http.server / requests / urllib
@@ -17,21 +17,23 @@ Boot sequence
   3. Register the master socket with the selector (EVENT_READ)
   4. Enter the central while-True select loop
      • READ on master socket  → accept_handler   (new client arrives)
-     • READ on client socket  → read_handler     (accumulate → parse → respond)
+     • READ on client socket  → read_handler     (accumulate → parse → forward → relay)
   5. A SIGINT / SIGTERM handler tears down all open descriptors cleanly
 
-Phase 2 additions
+Phase 3 additions
 ─────────────────
-  • Byte accumulation into session_buffers[fd]["raw_payload"] across recv() calls
-  • b"\r\n\r\n" boundary scanning — handler returns early if headers are incomplete
-  • Manual HTTP/1.1 header parsing: method, path, version, Content-Length, Connection
-  • 400 Bad Request on malformed input or buffer overflow (> MAX_HEADER_BUFFER bytes)
-  • Hardcoded 200 OK mock response so curl/browser closes cleanly (no forwarding yet)
+  • _pick_backend()          — atomic round-robin cursor over backend_pool["servers"]
+  • _forward_to_backend()   — opens a raw blocking TCP socket to the chosen upstream,
+                               sends the exact client byte payload, reads the full
+                               response in RECV_CHUNK blocks, relays back to client.
+  • Both client and upstream sockets are closed after each transaction.
+    (Phase 4 will introduce TCP connection pooling to skip the handshake.)
 
-Verification (Phase 2 boundary):
-  $ python janus_core.py
-  $ curl -v http://localhost:5000/          # → logs Method=GET Path=/ Connection=keep-alive
-  $ curl -v -X POST http://localhost:5000/data -d "hello"  # → logs Content-Length=5
+Verification (Phase 3 boundary):
+  $ python mock_backends.py       # terminal 1 — boots srv_01/02/03
+  $ python janus_core.py          # terminal 2 — proxy
+  # Repeatedly hit http://localhost:5000/ — response body must cycle:
+  #   Backend Server 01 → Backend Server 02 → Backend Server 03 → 01 …
 """
 
 import io
@@ -56,15 +58,7 @@ SELECT_TIMEOUT: float = 1.0          # seconds — keeps the loop interruptible
 RECV_CHUNK: int = 4096               # maximum bytes read per recv() call
 MAX_HEADER_BUFFER: int = 8192        # TRD §5 — reject and 400 if no \r\n\r\n by this size
 
-# ── Phase 2: hardcoded mock response (replaced by real upstream relay in Phase 3) ──
-_MOCK_200: bytes = (
-    b"HTTP/1.1 200 OK\r\n"
-    b"Content-Type: text/plain\r\n"
-    b"Content-Length: 18\r\n"
-    b"Connection: close\r\n"
-    b"\r\n"
-    b"Janus Parser Alive"
-)
+# ── Error responses: raw byte literals, no string-formatting libs ──────────
 _BAD_REQUEST_400: bytes = (
     b"HTTP/1.1 400 Bad Request\r\n"
     b"Content-Type: text/plain\r\n"
@@ -73,12 +67,20 @@ _BAD_REQUEST_400: bytes = (
     b"\r\n"
     b"Bad Request"
 )
+_BAD_GATEWAY_502: bytes = (
+    b"HTTP/1.1 502 Bad Gateway\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"Content-Length: 11\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b"Bad Gateway"
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# IN-MEMORY STATE STRUCTURES  (Phase 1 subset — only what Phase 1 touches)
+# IN-MEMORY STATE STRUCTURES
 #
-# Full schemas are defined in the TRD / in-memory-state docs.  Later phases
-# will populate and mutate these; Phase 1 merely declares and owns them.
+# Full schemas are defined in the TRD / in-memory-state docs.  All four
+# structures are declared here at module level; later phases mutate them.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # session_buffers  ── Dict[int, Dict]
@@ -242,8 +244,161 @@ def _parse_http_headers(raw: bytes) -> dict | None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PHASE 1 CALLBACKS
+# PHASE 3 — ROUND-ROBIN ROUTER & UPSTREAM TCP RELAY
 # ──────────────────────────────────────────────────────────────────────────────
+
+# Ordered list of server IDs — preserves a stable cycling sequence that the
+# round-robin cursor can advance through with a simple modulo operation.
+_SERVER_ORDER: list[str] = ["srv_01", "srv_02", "srv_03"]
+
+# Upstream connect/receive timeout in seconds.  Blocking sockets are used for
+# the upstream leg in Phase 3 (Phase 4 will switch to non-blocking pool sockets).
+UPSTREAM_TIMEOUT: float = 5.0
+
+
+def _pick_backend() -> dict | None:
+    """
+    Atomically select the next healthy backend using Round-Robin logic.
+
+    Algorithm
+    ─────────
+    1. Acquire backend_pool["lock"] so the Phase 4 health-monitor thread
+       cannot mutate `is_healthy` flags mid-selection.
+    2. Walk _SERVER_ORDER starting from `active_index` (wrapping with modulo).
+    3. Return the first server dict whose `healthy` flag is True.
+    4. Advance `active_index` past the chosen server so the *next* call picks
+       the following one, guaranteeing strict sequential distribution.
+    5. If all servers are unhealthy, return None.
+
+    The lock is held only for the cursor read/write — not during the actual
+    network I/O — so it never stalls the event loop for long.
+    """
+    servers = backend_pool["servers"]
+    n       = len(_SERVER_ORDER)
+
+    with backend_pool["lock"]:
+        start = backend_pool["active_index"]
+
+        for offset in range(n):
+            idx       = (start + offset) % n
+            server_id = _SERVER_ORDER[idx]
+            srv       = servers[server_id]
+
+            if srv["healthy"]:
+                # Advance the cursor PAST the chosen server so the next call
+                # picks the one after it, not the same one again.
+                backend_pool["active_index"] = (idx + 1) % n
+                return {"id": server_id, **srv}
+
+    # All servers are currently marked unhealthy.
+    return None
+
+
+def _forward_to_backend(
+    client_sock:  socket.socket,
+    client_fd:    int,
+    raw_payload:  bytes,
+    server:       dict,
+) -> None:
+    """
+    Open a raw TCP connection to `server`, relay `raw_payload` upstream,
+    read the full response, and pipe every byte back to `client_sock`.
+
+    Phase 3 contract:
+      • Uses a plain blocking socket for the upstream leg.  Simple and correct;
+        Phase 4 will replace this with pooled non-blocking sockets.
+      • Reads the upstream response in RECV_CHUNK (4096-byte) increments until
+        recv() returns an empty bytes object (server closed its end).
+      • Closes the upstream socket immediately after the relay completes.
+        (Phase 4 will recycle it into socket_pool instead.)
+      • On any OSError during upstream connect or send, writes _BAD_GATEWAY_502
+        to the client and returns.
+
+    The caller (_handle_parsed_request) is responsible for closing client_sock
+    and cleaning up session_buffers after this function returns.
+    """
+    host: str = server["host"]
+    port: int = server["port"]
+    srv_id    = server["id"]
+
+    # ── Open upstream connection ──────────────────────────────────────────────
+    upstream_sock: socket.socket | None = None
+    try:
+        upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        upstream_sock.settimeout(UPSTREAM_TIMEOUT)       # blocking with timeout
+        upstream_sock.connect((host, port))
+    except OSError as exc:
+        _log("WARN ", f"[UPSTREAM] fd={client_fd:<6} {srv_id} connect failed — {exc}")
+        try:
+            client_sock.sendall(_BAD_GATEWAY_502)
+        except OSError:
+            pass
+        if upstream_sock:
+            try:
+                upstream_sock.close()
+            except OSError:
+                pass
+        return
+
+    _log("INFO ",
+         f"[ROUTE   ] fd={client_fd:<6} -> {srv_id}  "
+         f"({host}:{port})  payload={len(raw_payload)} bytes")
+
+    # ── Forward the exact client byte payload upstream ────────────────────────
+    try:
+        upstream_sock.sendall(raw_payload)
+    except OSError as exc:
+        _log("WARN ", f"[UPSTREAM] fd={client_fd:<6} {srv_id} send failed — {exc}")
+        try:
+            client_sock.sendall(_BAD_GATEWAY_502)
+        except OSError:
+            pass
+        upstream_sock.close()
+        return
+
+    # ── Read the upstream response in chunks and relay to client ─────────────
+    total_relayed: int = 0
+    relay_start:   float = time.perf_counter()
+
+    try:
+        while True:
+            try:
+                chunk = upstream_sock.recv(RECV_CHUNK)
+            except OSError as exc:
+                _log("WARN ", f"[UPSTREAM] fd={client_fd:<6} {srv_id} recv failed — {exc}")
+                break
+
+            if not chunk:
+                # Server closed its end — response complete.
+                break
+
+            try:
+                client_sock.sendall(chunk)
+            except OSError as exc:
+                _log("WARN ",
+                     f"[RELAY   ] fd={client_fd:<6} client send failed — {exc}")
+                break
+
+            total_relayed += len(chunk)
+
+    finally:
+        # Phase 3: always close upstream.  Phase 4 will recycle it instead.
+        try:
+            upstream_sock.close()
+        except OSError:
+            pass
+
+    latency_ms = (time.perf_counter() - relay_start) * 1000
+
+    # Update global telemetry counters (serialised to port 5001 in Phase 6).
+    _metrics["aggregate_bytes_transferred"] += total_relayed
+
+    _log("INFO ",
+         f"[RELAY   ] fd={client_fd:<6} <- {srv_id}  "
+         f"{total_relayed} bytes  latency={latency_ms:.2f}ms  "
+         f"req_total={_metrics['total_requests_processed']}")
+
+
 
 def accept_handler(master_sock: socket.socket, mask: int, sel: selectors.BaseSelector) -> None:
     """
@@ -391,18 +546,30 @@ def read_handler(client_sock: socket.socket, mask: int, sel: selectors.BaseSelec
     # Bump the global processed-requests counter (Phase 6 telemetry).
     _metrics["total_requests_processed"] += 1
 
-    # ── Step 7: Send Phase 2 mock response & close ───────────────────────────
-    # Phase 3 will replace this block with real upstream forwarding.
-    try:
-        client_sock.sendall(_MOCK_200)
-    except OSError as exc:
-        _log("WARN ", f"[SEND ERR] fd={client_fd}  — {exc}")
+    # ── Step 7: Round-Robin — pick the next healthy backend ──────────────────
+    server = _pick_backend()
 
-    _log("INFO ",
-         f"[RESPOND ] fd={client_fd:<6} "
-         f"-> 200 OK  (mock, {len(_MOCK_200)} bytes)  "
-         f"req_total={_metrics['total_requests_processed']}")
+    if server is None:
+        # Every backend is currently offline — return 502 and close.
+        _log("WARN ", f"[NO BKND ] fd={client_fd:<6} — all backends unhealthy -> 502")
+        try:
+            client_sock.sendall(_BAD_GATEWAY_502)
+        except OSError:
+            pass
+        _teardown_client(client_sock, sel)
+        return
 
+    # ── Step 8: Forward payload upstream and relay response to client ─────────
+    # Pass the full accumulated raw_payload (headers + any body bytes) so the
+    # backend receives a well-formed HTTP request.
+    _forward_to_backend(
+        client_sock=client_sock,
+        client_fd=client_fd,
+        raw_payload=session["raw_payload"],
+        server=server,
+    )
+
+    # Phase 3: close client after each transaction (Phase 4 adds keep-alive).
     _teardown_client(client_sock, sel)
 
 
@@ -519,17 +686,18 @@ def main() -> None:
         data=lambda sock, mask: accept_handler(sock, mask, sel),
     )
 
-    _log("INFO ", "=" * 60)
-    _log("INFO ", " JANUS  —  Layer 7 Load Balancer  [Phase 2 Boot]")
-    _log("INFO ", "=" * 60)
-    _log("INFO ", f" Listening on    {PROXY_HOST}:{PROXY_PORT}")
-    _log("INFO ", f" Selector        {type(sel).__name__}")
-    _log("INFO ", f" Select tick     {SELECT_TIMEOUT}s timeout")
-    _log("INFO ", f" Recv chunk      {RECV_CHUNK} bytes")
-    _log("INFO ", f" Max hdr buffer  {MAX_HEADER_BUFFER} bytes")
-    _log("INFO ", " Backends        srv_01:8001  srv_02:8002  srv_03:8003")
-    _log("INFO ", " Mode            Phase 2 — accumulate + parse + mock-respond")
-    _log("INFO ", "=" * 60)
+    _log("INFO ", "=" * 62)
+    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 3 Boot]")
+    _log("INFO ", "=" * 62)
+    _log("INFO ", f"  Listening on    {PROXY_HOST}:{PROXY_PORT}")
+    _log("INFO ", f"  Selector        {type(sel).__name__}")
+    _log("INFO ", f"  Select tick     {SELECT_TIMEOUT}s timeout")
+    _log("INFO ", f"  Recv chunk      {RECV_CHUNK} bytes")
+    _log("INFO ", f"  Max hdr buffer  {MAX_HEADER_BUFFER} bytes")
+    _log("INFO ", f"  Upstream tmout  {UPSTREAM_TIMEOUT}s")
+    _log("INFO ", "  Backends        srv_01:8001  srv_02:8002  srv_03:8003")
+    _log("INFO ", "  Mode            Phase 3 — round-robin forwarding (no pooling)")
+    _log("INFO ", "=" * 62)
     _log("INFO ", " Press Ctrl+C to stop.")
     _log("INFO ", "")
 
