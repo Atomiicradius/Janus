@@ -2,7 +2,7 @@
 janus_core.py
 =============
 Project : Janus — Custom Layer 7 Load Balancer
-Phase   : 3 — Downstream Proxy Routing & Round-Robin Balance
+Phase   : 4 — Threaded Health Monitoring & TCP Connection Pooling
 
 Constraints (strictly honoured):
   • No FastAPI / asyncio / http.server / requests / urllib
@@ -20,21 +20,22 @@ Boot sequence
      • READ on client socket  → read_handler     (accumulate → parse → forward → relay)
   5. A SIGINT / SIGTERM handler tears down all open descriptors cleanly
 
-Phase 3 additions
+Phase 4 additions
 ─────────────────
-  • _pick_backend()          — atomic round-robin cursor over backend_pool["servers"]
-  • _forward_to_backend()   — opens a raw blocking TCP socket to the chosen upstream,
-                               sends the exact client byte payload, reads the full
-                               response in RECV_CHUNK blocks, relays back to client.
-  • Both client and upstream sockets are closed after each transaction.
-    (Phase 4 will introduce TCP connection pooling to skip the handshake.)
+  • _health_monitor_loop()  — daemon thread waking every 3 s; probes each backend
+                               port with a 1.0 s TCP timeout; flips healthy flags
+                               under backend_pool["lock"] using fail/recover thresholds.
+  • _pool_acquire()         — checks socket_pool[srv_id] for a warm idle socket;
+                               peeks it to confirm liveness; falls back to fresh connect.
+  • _pool_release()         — pushes the upstream socket back into socket_pool instead
+                               of closing it (capped at SOCKET_POOL_MAX per server).
+  • _forward_to_backend()   — updated to call _pool_acquire / _pool_release.
 
-Verification (Phase 3 boundary):
-  $ python mock_backends.py       # terminal 1 — boots srv_01/02/03
-  $ python janus_core.py          # terminal 2 — proxy
-  # Repeatedly hit http://localhost:5000/ — response body must cycle:
-  #   Backend Server 01 → Backend Server 02 → Backend Server 03 → 01 …
-"""
+Verification (Phase 4 boundary):
+  $ python mock_backends.py       # terminal 1
+  $ python janus_core.py          # terminal 2
+  # Kill one backend process — proxy must route around it within 3 s without 502.
+  # Restart it — proxy must re-admit it automatically."""
 
 import io
 import selectors
@@ -251,9 +252,19 @@ def _parse_http_headers(raw: bytes) -> dict | None:
 # round-robin cursor can advance through with a simple modulo operation.
 _SERVER_ORDER: list[str] = ["srv_01", "srv_02", "srv_03"]
 
-# Upstream connect/receive timeout in seconds.  Blocking sockets are used for
-# the upstream leg in Phase 3 (Phase 4 will switch to non-blocking pool sockets).
+# Upstream connect/receive timeout in seconds.
 UPSTREAM_TIMEOUT: float = 5.0
+
+# ── Phase 4 tuning constants ──────────────────────────────────────────────────
+HEALTH_CHECK_INTERVAL:   float = 3.0  # seconds between heartbeat sweeps
+HEALTH_PROBE_TIMEOUT:    float = 1.0  # TCP connect timeout per probe
+HEALTH_FAIL_THRESHOLD:   int   = 3   # consecutive failures → mark unhealthy
+HEALTH_RECOVER_THRESHOLD: int  = 2   # consecutive successes → restore healthy
+SOCKET_POOL_MAX:          int   = 8   # max idle sockets kept per backend
+
+# Dedicated lock for socket_pool mutations so health-monitor thread can
+# drain a server's pool without racing the event-loop thread.
+socket_pool_lock: threading.Lock = threading.Lock()
 
 
 def _pick_backend() -> dict | None:
@@ -294,57 +305,266 @@ def _pick_backend() -> dict | None:
     return None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 4-A — BACKGROUND HEALTH MONITOR DAEMON
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _health_monitor_loop() -> None:
+    """
+    Runs inside a daemon threading.Thread started from main().
+
+    Every HEALTH_CHECK_INTERVAL seconds it iterates over every entry in
+    backend_pool["servers"] and attempts a TCP connect to its (host, port).
+
+    Failure path:
+      • A failed probe increments server["consecutive_failures"].
+      • Once consecutive_failures >= HEALTH_FAIL_THRESHOLD the server is
+        marked healthy=False under backend_pool["lock"].
+      • All pooled sockets for that server are drained and closed immediately
+        so the event loop never tries to reuse a socket to a dead backend.
+
+    Recovery path:
+      • A successful probe decrements consecutive_failures (floor 0) and
+        increments a transient "consecutive_successes" counter.
+      • Once consecutive_successes >= HEALTH_RECOVER_THRESHOLD the server is
+        restored to healthy=True and consecutive_failures is reset to 0.
+
+    Lock discipline:
+      • backend_pool["lock"] is held ONLY while reading/writing the health
+        flags — never during the network probe itself.  This means the lock
+        is held for microseconds, not milliseconds, so the event loop is
+        never blocked waiting for a slow probe.
+    """
+    # Per-server transient success counter lives only in this thread.
+    recovery_counters: dict[str, int] = {sid: 0 for sid in _SERVER_ORDER}
+
+    while _running:
+        time.sleep(HEALTH_CHECK_INTERVAL)
+        if not _running:
+            break
+
+        for server_id in _SERVER_ORDER:
+            # ── Read current config under lock ──────────────────────────────
+            with backend_pool["lock"]:
+                srv  = backend_pool["servers"][server_id]
+                host = srv["host"]
+                port = srv["port"]
+                was_healthy = srv["healthy"]
+
+            # ── Probe: attempt TCP handshake with a short timeout ────────────
+            probe_ok = False
+            try:
+                probe_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                probe_sock.settimeout(HEALTH_PROBE_TIMEOUT)
+                probe_sock.connect((host, port))
+                probe_sock.close()
+                probe_ok = True
+            except OSError:
+                try:
+                    probe_sock.close()
+                except OSError:
+                    pass
+
+            # ── Update state under lock ──────────────────────────────────────
+            with backend_pool["lock"]:
+                srv = backend_pool["servers"][server_id]
+
+                if probe_ok:
+                    # Successful probe: credit a recovery tick.
+                    srv["consecutive_failures"] = max(0, srv["consecutive_failures"] - 1)
+                    recovery_counters[server_id] += 1
+
+                    if (not was_healthy
+                            and recovery_counters[server_id] >= HEALTH_RECOVER_THRESHOLD):
+                        srv["healthy"] = True
+                        srv["consecutive_failures"] = 0
+                        recovery_counters[server_id] = 0
+                        _log("INFO ",
+                             f"[HEALTH  ] {server_id} RECOVERED — restored to routing pool")
+                    elif not was_healthy:
+                        _log("DEBUG",
+                             f"[HEALTH  ] {server_id} probing recovery "
+                             f"({recovery_counters[server_id]}/{HEALTH_RECOVER_THRESHOLD})")
+                else:
+                    # Failed probe.
+                    recovery_counters[server_id] = 0
+                    srv["consecutive_failures"] += 1
+                    fails = srv["consecutive_failures"]
+
+                    if was_healthy and fails >= HEALTH_FAIL_THRESHOLD:
+                        srv["healthy"] = False
+                        _log("WARN ",
+                             f"[HEALTH  ] {server_id} OFFLINE after "
+                             f"{fails} consecutive failures — removed from pool")
+                        # Drain pooled sockets for this server immediately.
+                        _drain_pool(server_id)
+                    elif was_healthy:
+                        _log("DEBUG",
+                             f"[HEALTH  ] {server_id} probe fail "
+                             f"{fails}/{HEALTH_FAIL_THRESHOLD}")
+
+
+def _drain_pool(server_id: str) -> None:
+    """
+    Close and discard every idle socket in socket_pool[server_id].
+    Called by the health monitor when a server goes offline so the event
+    loop never pops a stale socket to a dead backend.
+    """
+    with socket_pool_lock:
+        stale = socket_pool.get(server_id, [])
+        socket_pool[server_id] = []
+
+    for sock in stale:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    if stale:
+        _log("INFO ",
+             f"[POOL    ] drained {len(stale)} stale socket(s) for {server_id}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PHASE 4-B — CONNECTION POOL ACQUIRE / RELEASE
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _pool_acquire(server_id: str, host: str, port: int,
+                  client_fd: int) -> socket.socket | None:
+    """
+    Return a live, writable socket connected to (host, port).
+
+    Strategy
+    ────────
+    1. Pop from socket_pool[server_id] if any idle sockets are available.
+    2. Validate the popped socket with a non-blocking zero-byte recv() peek:
+         • EAGAIN/BlockingIOError  → socket is alive (no data, no close)  ✓
+         • 0-byte recv             → server closed its end quietly        ✗ discard
+         • Any other OSError       → socket is broken                     ✗ discard
+    3. If validation fails, try the next pooled socket.  Continue until
+       the pool is empty or a good socket is found.
+    4. If pool is exhausted, open a fresh blocking TCP connection.
+    5. Return None on fresh-connect failure (caller will send 502).
+    """
+    # ── Step 1 & 2: Try pooled sockets ──────────────────────────────────────
+    while True:
+        with socket_pool_lock:
+            pool = socket_pool.get(server_id, [])
+            if not pool:
+                break
+            candidate = pool.pop()
+
+        # Peek: set non-blocking temporarily, recv 1 byte with MSG_PEEK.
+        alive = False
+        try:
+            candidate.setblocking(False)
+            data = candidate.recv(1, socket.MSG_PEEK)
+            if data:
+                # There's unread data on the socket — still connected.
+                alive = True
+            # data == b"" means server sent FIN → dead, fall through.
+        except BlockingIOError:
+            # EAGAIN: no data waiting, socket is healthy.
+            alive = True
+        except OSError:
+            alive = False
+        finally:
+            try:
+                candidate.setblocking(True)
+                candidate.settimeout(UPSTREAM_TIMEOUT)
+            except OSError:
+                alive = False
+
+        if alive:
+            _log("DEBUG",
+                 f"[POOL    ] fd={client_fd:<6} reused warm socket "
+                 f"for {server_id} ({host}:{port})")
+            return candidate
+        else:
+            _log("DEBUG",
+                 f"[POOL    ] fd={client_fd:<6} discarded dead socket "
+                 f"for {server_id}")
+            try:
+                candidate.close()
+            except OSError:
+                pass
+
+    # ── Step 3: Fresh connect ────────────────────────────────────────────────
+    try:
+        fresh = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        fresh.settimeout(UPSTREAM_TIMEOUT)
+        fresh.connect((host, port))
+        _log("DEBUG",
+             f"[POOL    ] fd={client_fd:<6} opened fresh socket "
+             f"to {server_id} ({host}:{port})")
+        return fresh
+    except OSError as exc:
+        _log("WARN ",
+             f"[UPSTREAM] fd={client_fd:<6} {server_id} fresh connect failed — {exc}")
+        try:
+            fresh.close()
+        except OSError:
+            pass
+        return None
+
+
+def _pool_release(server_id: str, sock: socket.socket) -> None:
+    """
+    Return a completed upstream socket to the idle pool for reuse.
+
+    If the pool for this server is already at SOCKET_POOL_MAX, close the
+    socket immediately rather than letting the pool grow unboundedly.
+    The pool is also checked by the health monitor, so we hold
+    socket_pool_lock for the brief append/check operation.
+    """
+    with socket_pool_lock:
+        pool = socket_pool.setdefault(server_id, [])
+        if len(pool) < SOCKET_POOL_MAX:
+            pool.append(sock)
+            return
+
+    # Pool is full — discard.
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
 def _forward_to_backend(
-    client_sock:  socket.socket,
-    client_fd:    int,
-    raw_payload:  bytes,
-    server:       dict,
+    client_sock: socket.socket,
+    client_fd:   int,
+    raw_payload: bytes,
+    server:      dict,
 ) -> None:
     """
-    Open a raw TCP connection to `server`, relay `raw_payload` upstream,
-    read the full response, and pipe every byte back to `client_sock`.
+    Acquire an upstream socket (pooled or fresh), forward raw_payload,
+    stream the full response back to client_sock, then recycle the
+    upstream socket into the pool (Phase 4).
 
-    Phase 3 contract:
-      • Uses a plain blocking socket for the upstream leg.  Simple and correct;
-        Phase 4 will replace this with pooled non-blocking sockets.
-      • Reads the upstream response in RECV_CHUNK (4096-byte) increments until
-        recv() returns an empty bytes object (server closed its end).
-      • Closes the upstream socket immediately after the relay completes.
-        (Phase 4 will recycle it into socket_pool instead.)
-      • On any OSError during upstream connect or send, writes _BAD_GATEWAY_502
-        to the client and returns.
-
-    The caller (_handle_parsed_request) is responsible for closing client_sock
-    and cleaning up session_buffers after this function returns.
+    Error policy:
+      • If _pool_acquire() returns None, send 502 and return.
+      • On sendall failure: close upstream (don't recycle broken socket), 502.
+      • On recv failure mid-stream: close upstream, log, stop relay.
+      • On success: call _pool_release() so next request skips the handshake.
     """
-    host: str = server["host"]
-    port: int = server["port"]
-    srv_id    = server["id"]
+    host   = server["host"]
+    port   = server["port"]
+    srv_id = server["id"]
 
-    # ── Open upstream connection ──────────────────────────────────────────────
-    upstream_sock: socket.socket | None = None
-    try:
-        upstream_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        upstream_sock.settimeout(UPSTREAM_TIMEOUT)       # blocking with timeout
-        upstream_sock.connect((host, port))
-    except OSError as exc:
-        _log("WARN ", f"[UPSTREAM] fd={client_fd:<6} {srv_id} connect failed — {exc}")
+    # ── Acquire: pooled warm socket or fresh connect ─────────────────────────
+    upstream_sock = _pool_acquire(srv_id, host, port, client_fd)
+    if upstream_sock is None:
         try:
             client_sock.sendall(_BAD_GATEWAY_502)
         except OSError:
             pass
-        if upstream_sock:
-            try:
-                upstream_sock.close()
-            except OSError:
-                pass
         return
 
     _log("INFO ",
          f"[ROUTE   ] fd={client_fd:<6} -> {srv_id}  "
          f"({host}:{port})  payload={len(raw_payload)} bytes")
 
-    # ── Forward the exact client byte payload upstream ────────────────────────
+    # ── Forward the exact client byte payload ──────────────────────────────
     try:
         upstream_sock.sendall(raw_payload)
     except OSError as exc:
@@ -353,50 +573,56 @@ def _forward_to_backend(
             client_sock.sendall(_BAD_GATEWAY_502)
         except OSError:
             pass
-        upstream_sock.close()
-        return
-
-    # ── Read the upstream response in chunks and relay to client ─────────────
-    total_relayed: int = 0
-    relay_start:   float = time.perf_counter()
-
-    try:
-        while True:
-            try:
-                chunk = upstream_sock.recv(RECV_CHUNK)
-            except OSError as exc:
-                _log("WARN ", f"[UPSTREAM] fd={client_fd:<6} {srv_id} recv failed — {exc}")
-                break
-
-            if not chunk:
-                # Server closed its end — response complete.
-                break
-
-            try:
-                client_sock.sendall(chunk)
-            except OSError as exc:
-                _log("WARN ",
-                     f"[RELAY   ] fd={client_fd:<6} client send failed — {exc}")
-                break
-
-            total_relayed += len(chunk)
-
-    finally:
-        # Phase 3: always close upstream.  Phase 4 will recycle it instead.
         try:
-            upstream_sock.close()
+            upstream_sock.close()      # broken — discard, don't recycle
         except OSError:
             pass
+        return
+
+    # ── Stream response from upstream back to client ────────────────────────
+    total_relayed = 0
+    relay_start   = time.perf_counter()
+    relay_ok      = True
+
+    while True:
+        try:
+            chunk = upstream_sock.recv(RECV_CHUNK)
+        except OSError as exc:
+            _log("WARN ", f"[UPSTREAM] fd={client_fd:<6} {srv_id} recv failed — {exc}")
+            relay_ok = False
+            break
+
+        if not chunk:
+            break                       # server closed connection cleanly
+
+        try:
+            client_sock.sendall(chunk)
+        except OSError as exc:
+            _log("WARN ", f"[RELAY   ] fd={client_fd:<6} client send failed — {exc}")
+            relay_ok = False
+            break
+
+        total_relayed += len(chunk)
 
     latency_ms = (time.perf_counter() - relay_start) * 1000
-
-    # Update global telemetry counters (serialised to port 5001 in Phase 6).
     _metrics["aggregate_bytes_transferred"] += total_relayed
 
     _log("INFO ",
          f"[RELAY   ] fd={client_fd:<6} <- {srv_id}  "
          f"{total_relayed} bytes  latency={latency_ms:.2f}ms  "
          f"req_total={_metrics['total_requests_processed']}")
+
+    # ── Release: recycle on success, close on error ─────────────────────────
+    if relay_ok:
+        _pool_release(srv_id, upstream_sock)
+        pool_size = len(socket_pool.get(srv_id, []))
+        _log("DEBUG",
+             f"[POOL    ] {srv_id} pool_size={pool_size} after release")
+    else:
+        try:
+            upstream_sock.close()
+        except OSError:
+            pass
 
 
 
@@ -687,18 +913,30 @@ def main() -> None:
     )
 
     _log("INFO ", "=" * 62)
-    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 3 Boot]")
+    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 4 Boot]")
     _log("INFO ", "=" * 62)
     _log("INFO ", f"  Listening on    {PROXY_HOST}:{PROXY_PORT}")
     _log("INFO ", f"  Selector        {type(sel).__name__}")
-    _log("INFO ", f"  Select tick     {SELECT_TIMEOUT}s timeout")
     _log("INFO ", f"  Recv chunk      {RECV_CHUNK} bytes")
     _log("INFO ", f"  Max hdr buffer  {MAX_HEADER_BUFFER} bytes")
     _log("INFO ", f"  Upstream tmout  {UPSTREAM_TIMEOUT}s")
+    _log("INFO ", f"  Health interval {HEALTH_CHECK_INTERVAL}s  "
+                  f"fail@{HEALTH_FAIL_THRESHOLD}  recover@{HEALTH_RECOVER_THRESHOLD}")
+    _log("INFO ", f"  Pool max        {SOCKET_POOL_MAX} sockets/backend")
     _log("INFO ", "  Backends        srv_01:8001  srv_02:8002  srv_03:8003")
-    _log("INFO ", "  Mode            Phase 3 — round-robin forwarding (no pooling)")
+    _log("INFO ", "  Mode            Phase 4 — health monitoring + connection pooling")
     _log("INFO ", "=" * 62)
-    _log("INFO ", " Press Ctrl+C to stop.")
+    _log("INFO ", "  Press Ctrl+C to stop.")
+    _log("INFO ", "")
+
+    # ── Spawn the background health-monitor daemon ────────────────────────────
+    health_thread = threading.Thread(
+        target=_health_monitor_loop,
+        name="janus-health-monitor",
+        daemon=True,         # dies automatically when the main process exits
+    )
+    health_thread.start()
+    _log("INFO ", f"  Health monitor started (tid={health_thread.ident})")
     _log("INFO ", "")
 
     try:
