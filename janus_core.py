@@ -76,6 +76,14 @@ _BAD_GATEWAY_502: bytes = (
     b"\r\n"
     b"Bad Gateway"
 )
+_TOO_MANY_REQUESTS_429: bytes = (
+    b"HTTP/1.1 429 Too Many Requests\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"Content-Length: 19\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b"Rate Limit Exceeded"
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # IN-MEMORY STATE STRUCTURES
@@ -125,10 +133,15 @@ socket_pool: dict = {
 
 # rate_limit_cache  ── Dict[str, Dict]
 #   Token-bucket ledger keyed by client IP string (Phase 5).
-#   Config constants: BUCKET_MAX = 30.0 tokens, REFILL_RATE = 2.0 tokens/sec.
+#   Schema: { "1.2.3.4": {"tokens": float, "last_replenished": float} }
 rate_limit_cache: dict = {}
-BUCKET_MAX:   float = 30.0
-REFILL_RATE:  float = 2.0   # tokens per second
+BUCKET_MAX:   float = 30.0  # max tokens a single client IP can accumulate
+REFILL_RATE:  float = 2.0   # tokens replenished per second (continuous drip)
+
+# Mutex protecting rate_limit_cache reads and writes.
+# Held only for pure arithmetic — never during network I/O — so hold
+# time is microseconds and the event loop is never measurably stalled.
+rate_limit_lock: threading.Lock = threading.Lock()
 
 # Global telemetry counters — serialised to JSON on port 5001 in Phase 6.
 _metrics: dict = {
@@ -631,13 +644,14 @@ def accept_handler(master_sock: socket.socket, mask: int, sel: selectors.BaseSel
     Called by the event loop whenever the master socket becomes readable,
     meaning the OS has completed a TCP 3-way handshake with a new client.
 
-    Responsibilities (Phase 1):
-      1. Accept the connection — extract the raw client socket and address.
-      2. Set the client socket to non-blocking mode immediately.
-      3. Allocate a fresh session_buffers entry keyed by the client's fd.
-      4. Register the client socket with the selector for EVENT_READ.
-         The attached data object is the read_handler callback so the loop
-         can dispatch uniformly via  key.data(key.fileobj, mask).
+    Phase 5 execution order (Bouncer gate is the FIRST thing that runs):
+      1. accept()            — extract raw socket + client IP.
+      2. TOKEN-BUCKET CHECK  — evaluate rate_limit_cache[client_ip].
+                               BLOCK  → send 429, close socket, return.
+                               PASS   → continue below.
+      3. setblocking(False)  — mandatory for the selector model.
+      4. session_buffers allocation.
+      5. sel.register()      — client enters the event loop.
     """
     try:
         client_sock, client_addr = master_sock.accept()
@@ -649,6 +663,58 @@ def accept_handler(master_sock: socket.socket, mask: int, sel: selectors.BaseSel
     client_ip: str = client_addr[0]
     client_fd: int = client_sock.fileno()
 
+    # ── Phase 5: Token-bucket gate ────────────────────────────────────────────
+    # Runs immediately after accept() — before setblocking, session alloc,
+    # or selector registration.  Blocked clients consume zero server resources.
+    now: float = time.monotonic()  # monotonic: immune to wall-clock adjustments
+
+    with rate_limit_lock:
+        entry = rate_limit_cache.get(client_ip)
+
+        if entry is None:
+            # First request from this IP — initialise a full bucket.
+            rate_limit_cache[client_ip] = {
+                "tokens":           BUCKET_MAX,
+                "last_replenished": now,
+            }
+            entry = rate_limit_cache[client_ip]
+
+        else:
+            # Lazy replenishment: credit tokens earned since last visit.
+            elapsed = now - entry["last_replenished"]
+            entry["tokens"] = min(
+                BUCKET_MAX,
+                entry["tokens"] + elapsed * REFILL_RATE,
+            )
+            entry["last_replenished"] = now
+
+        # ── Gatekeeper decision ────────────────────────────────────────
+        if entry["tokens"] >= 1.0:
+            entry["tokens"] -= 1.0      # admit: spend one token
+            admitted = True
+        else:
+            admitted = False
+            current_tokens = entry["tokens"]   # snapshot before releasing lock
+
+    # Lock released before any I/O — hold time was pure arithmetic only.
+
+    if not admitted:
+        # ── BLOCKED ──
+        _metrics["total_blocked_connections"] += 1
+        _log("WARN ",
+             f"[BOUNCER ] fd={client_fd:<6} src={client_ip:<18} "
+             f"Dropped due to rate limit (Tokens: {current_tokens:.2f})")
+        try:
+            client_sock.sendall(_TOO_MANY_REQUESTS_429)
+        except OSError:
+            pass
+        try:
+            client_sock.close()
+        except OSError:
+            pass
+        return  # never reaches selector registration
+
+    # ── ADMITTED ──
     # Enforce non-blocking I/O — mandatory for the selector model.
     client_sock.setblocking(False)
 
@@ -913,7 +979,7 @@ def main() -> None:
     )
 
     _log("INFO ", "=" * 62)
-    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 4 Boot]")
+    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 5 Boot]")
     _log("INFO ", "=" * 62)
     _log("INFO ", f"  Listening on    {PROXY_HOST}:{PROXY_PORT}")
     _log("INFO ", f"  Selector        {type(sel).__name__}")
@@ -923,8 +989,9 @@ def main() -> None:
     _log("INFO ", f"  Health interval {HEALTH_CHECK_INTERVAL}s  "
                   f"fail@{HEALTH_FAIL_THRESHOLD}  recover@{HEALTH_RECOVER_THRESHOLD}")
     _log("INFO ", f"  Pool max        {SOCKET_POOL_MAX} sockets/backend")
+    _log("INFO ", f"  Bouncer Mode    capacity={BUCKET_MAX} tok  refill={REFILL_RATE} tok/s")
     _log("INFO ", "  Backends        srv_01:8001  srv_02:8002  srv_03:8003")
-    _log("INFO ", "  Mode            Phase 4 — health monitoring + connection pooling")
+    _log("INFO ", "  Mode            Phase 5 — Bouncer Mode token-bucket ACTIVE")
     _log("INFO ", "=" * 62)
     _log("INFO ", "  Press Ctrl+C to stop.")
     _log("INFO ", "")
