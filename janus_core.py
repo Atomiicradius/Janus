@@ -2,7 +2,7 @@
 janus_core.py
 =============
 Project : Janus — Custom Layer 7 Load Balancer
-Phase   : 4 — Threaded Health Monitoring & TCP Connection Pooling
+Phase   : 6 — Telemetry JSON APIs & Y2K CRT Admin Dashboard
 
 Constraints (strictly honoured):
   • No FastAPI / asyncio / http.server / requests / urllib
@@ -38,6 +38,7 @@ Verification (Phase 4 boundary):
   # Restart it — proxy must re-admit it automatically."""
 
 import io
+import json
 import selectors
 import signal
 import socket
@@ -53,8 +54,10 @@ if hasattr(sys.stdout, "reconfigure"):
 # GLOBAL CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────────
 
-PROXY_HOST: str = "0.0.0.0"
-PROXY_PORT: int = 5000
+PROXY_HOST: str  = "0.0.0.0"
+PROXY_PORT: int  = 5000
+ADMIN_HOST: str  = "0.0.0.0"
+ADMIN_PORT: int  = 5001   # Phase 6 — telemetry / management API port
 SELECT_TIMEOUT: float = 1.0          # seconds — keeps the loop interruptible
 RECV_CHUNK: int = 4096               # maximum bytes read per recv() call
 MAX_HEADER_BUFFER: int = 8192        # TRD §5 — reject and 400 if no \r\n\r\n by this size
@@ -75,6 +78,14 @@ _BAD_GATEWAY_502: bytes = (
     b"Connection: close\r\n"
     b"\r\n"
     b"Bad Gateway"
+)
+_NOT_FOUND_404: bytes = (
+    b"HTTP/1.1 404 Not Found\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"Content-Length: 9\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b"Not Found"
 )
 _TOO_MANY_REQUESTS_429: bytes = (
     b"HTTP/1.1 429 Too Many Requests\r\n"
@@ -896,6 +907,158 @@ def _teardown_client(client_sock: socket.socket, sel: selectors.BaseSelector) ->
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# PHASE 6 — ADMIN TELEMETRY API  (port 5001)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _build_admin_socket() -> socket.socket:
+    """
+    Allocate the administrative TCP socket bound to ADMIN_PORT (5001).
+    Identical setup to the proxy master socket: SO_REUSEADDR + non-blocking.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((ADMIN_HOST, ADMIN_PORT))
+    sock.listen(32)
+    sock.setblocking(False)
+    return sock
+
+
+def _serve_metrics(admin_client: socket.socket) -> None:
+    """
+    Compile a live JSON telemetry snapshot and write it to `admin_client`.
+
+    All shared-state reads are wrapped in their respective mutex locks so the
+    response is always internally consistent despite concurrent health-monitor
+    and event-loop mutations:
+
+      backend_pool["lock"]  — guards backend healthy/failure flags
+      socket_pool_lock      — guards pool list lengths
+      rate_limit_lock       — guards rate_limit_cache iteration
+
+    The JSON schema:
+    {
+      "uptime_seconds": float,
+      "metrics": {
+        "total_requests_processed":   int,
+        "aggregate_bytes_transferred": int,
+        "total_blocked_connections":  int,
+      },
+      "backends": {
+        "srv_01": {"host": str, "port": int, "healthy": bool,
+                   "consecutive_failures": int},
+        ...
+      },
+      "pools": {
+        "srv_01": int,   # warm idle sockets available
+        ...
+      },
+      "rate_limits": {
+        "tracked_ips": int
+      }
+    }
+    """
+    now = time.time()
+
+    # ── Snapshot backend state under lock ────────────────────────────────────
+    with backend_pool["lock"]:
+        backends_snap = {
+            sid: {
+                "host":                 srv["host"],
+                "port":                 srv["port"],
+                "healthy":              srv["healthy"],
+                "consecutive_failures": srv["consecutive_failures"],
+            }
+            for sid, srv in backend_pool["servers"].items()
+        }
+
+    # ── Snapshot pool depths under lock ──────────────────────────────────────
+    with socket_pool_lock:
+        pools_snap = {sid: len(lst) for sid, lst in socket_pool.items()}
+
+    # ── Count tracked IPs under lock ─────────────────────────────────────────
+    with rate_limit_lock:
+        tracked_ips = len(rate_limit_cache)
+
+    payload = {
+        "uptime_seconds": round(now - _metrics["start_time"], 2),
+        "metrics": {
+            "total_requests_processed":    _metrics["total_requests_processed"],
+            "aggregate_bytes_transferred": _metrics["aggregate_bytes_transferred"],
+            "total_blocked_connections":   _metrics["total_blocked_connections"],
+        },
+        "backends": backends_snap,
+        "pools":    pools_snap,
+        "rate_limits": {
+            "tracked_ips": tracked_ips,
+        },
+    }
+
+    body    = json.dumps(payload, indent=2).encode("utf-8")
+    headers = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Access-Control-Allow-Origin: *\r\n"
+        + f"Content-Length: {len(body)}\r\n".encode()
+        + b"Connection: close\r\n"
+        b"\r\n"
+    )
+    try:
+        admin_client.sendall(headers + body)
+    except OSError:
+        pass
+
+
+def admin_accept_handler(
+    admin_master: socket.socket,
+    mask: int,
+    sel: selectors.BaseSelector,
+) -> None:
+    """
+    Accept one admin connection, read the request line, dispatch to
+    _serve_metrics() if the path is /api/v1/metrics, else return 404.
+
+    Admin connections are ephemeral: serve one request, then immediately
+    close the socket.  No session buffer, no selector registration needed
+    — the admin port is deliberately simple and stateless.
+    """
+    try:
+        client, addr = admin_master.accept()
+    except OSError:
+        return
+
+    client.settimeout(2.0)   # admin client gets a 2-second read deadline
+    try:
+        raw = client.recv(512)
+    except OSError:
+        raw = b""
+    finally:
+        client.settimeout(None)
+
+    # Parse only the request line — we only need the path.
+    path = "/"
+    if raw:
+        first_line = raw.split(b"\r\n")[0].decode(errors="replace")
+        parts = first_line.split()
+        if len(parts) >= 2:
+            path = parts[1]
+
+    if path == "/api/v1/metrics":
+        _serve_metrics(client)
+        _log("DEBUG", f"[ADMIN   ] {addr[0]} GET /api/v1/metrics — served")
+    else:
+        try:
+            client.sendall(_NOT_FOUND_404)
+        except OSError:
+            pass
+        _log("DEBUG", f"[ADMIN   ] {addr[0]} {path} — 404")
+
+    try:
+        client.close()
+    except OSError:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # GRACEFUL SHUTDOWN
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -968,20 +1131,28 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown_handler)
 
     master_sock = _build_master_socket()
+    admin_sock  = _build_admin_socket()
     sel = selectors.DefaultSelector()
 
-    # Register the master socket.  The callback is a lambda that injects the
-    # selector reference so accept_handler can register new client sockets.
+    # Register the proxy master socket.
     sel.register(
         master_sock,
         selectors.EVENT_READ,
         data=lambda sock, mask: accept_handler(sock, mask, sel),
     )
 
+    # Register the admin master socket on port 5001.
+    sel.register(
+        admin_sock,
+        selectors.EVENT_READ,
+        data=lambda sock, mask: admin_accept_handler(sock, mask, sel),
+    )
+
     _log("INFO ", "=" * 62)
-    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 5 Boot]")
+    _log("INFO ", "  JANUS  —  Layer 7 Load Balancer  [Phase 6 Boot]")
     _log("INFO ", "=" * 62)
-    _log("INFO ", f"  Listening on    {PROXY_HOST}:{PROXY_PORT}")
+    _log("INFO ", f"  Proxy port      {PROXY_HOST}:{PROXY_PORT}")
+    _log("INFO ", f"  Admin API port  {ADMIN_HOST}:{ADMIN_PORT}  (GET /api/v1/metrics)")
     _log("INFO ", f"  Selector        {type(sel).__name__}")
     _log("INFO ", f"  Recv chunk      {RECV_CHUNK} bytes")
     _log("INFO ", f"  Max hdr buffer  {MAX_HEADER_BUFFER} bytes")
@@ -991,7 +1162,7 @@ def main() -> None:
     _log("INFO ", f"  Pool max        {SOCKET_POOL_MAX} sockets/backend")
     _log("INFO ", f"  Bouncer Mode    capacity={BUCKET_MAX} tok  refill={REFILL_RATE} tok/s")
     _log("INFO ", "  Backends        srv_01:8001  srv_02:8002  srv_03:8003")
-    _log("INFO ", "  Mode            Phase 5 — Bouncer Mode token-bucket ACTIVE")
+    _log("INFO ", "  Mode            Phase 6 — Telemetry API + CRT Dashboard")
     _log("INFO ", "=" * 62)
     _log("INFO ", "  Press Ctrl+C to stop.")
     _log("INFO ", "")
@@ -1032,9 +1203,9 @@ def main() -> None:
         _log("INFO ", "")
         _log("INFO ", "Closing all open descriptors …")
 
-        # Close every registered client socket before the master.
+        # Close every registered client socket before the masters.
         for key in list(sel.get_map().values()):
-            if key.fileobj is not master_sock:
+            if key.fileobj not in (master_sock, admin_sock):
                 try:
                     sel.unregister(key.fileobj)
                     key.fileobj.close()
@@ -1043,6 +1214,7 @@ def main() -> None:
 
         sel.close()
         master_sock.close()
+        admin_sock.close()
 
         open_sessions = len(session_buffers)
         if open_sessions:
